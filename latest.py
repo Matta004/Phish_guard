@@ -234,36 +234,90 @@ class PhishingDetector:
     def __init__(self, model_path):
         self.model_path = model_path
         try:
-            self.model = joblib.load(model_path)
-            logging.info("Phishing model loaded successfully")
+            loaded = joblib.load(model_path)
+            
+            # Handle case where loaded object is a tuple/list
+            if isinstance(loaded, (tuple, list)):
+                # Try to find the model in the tuple/list
+                for item in loaded:
+                    if hasattr(item, 'predict'):
+                        self.pipeline = item
+                        logging.info("Found model in tuple/list")
+                        break
+                else:
+                    raise ValueError("No model object found in loaded tuple/list")
+            else:
+                self.pipeline = loaded
+                
+            if not hasattr(self.pipeline, 'predict'):
+                raise ValueError("Loaded object is not a valid scikit-learn pipeline")
+            logging.info("Phishing model pipeline loaded successfully")
         except Exception as e:
             logging.error(f"Failed to load phishing model: {e}")
-            self.model = None
+            self.pipeline = None
+
+    def _prepare_features(self, email_data):
+        """Prepare input features in the format expected by the pipeline"""
+        # Combine subject and body with proper spacing
+        email_text = f"{email_data.get('subject', '')} {email_data.get('body', '')}"
+        
+        # Create a DataFrame with the same structure as training data
+        df = pd.DataFrame({
+            'Email_Text': [email_text]
+        })
+        
+        return df
 
     def predict(self, email_data):
         try:
-            if not self.model:
+            if not self.pipeline:
                 return "Error", 0.0
             
-            # Prepare features for prediction
-            features = self._extract_features(email_data)
-            prediction = self.model.predict([features])[0]
-            probability = self.model.predict_proba([features])[0][1]
+            # Prepare input data
+            df = self._prepare_features(email_data)
             
-            return "Phishing Email" if prediction == 1 else "Safe Email", probability
+            # Get probability scores
+            prob = self.pipeline.predict_proba(df)[0][1]  # Probability of being phishing
+            
+            # Adjust confidence thresholds
+            PHISHING_THRESHOLD = 0.4  # Lower threshold to catch more phishing emails
+            SAFE_THRESHOLD = 0.6      # Higher threshold to be more certain about safe emails
+            
+            # Adjust confidence scoring
+            if prob > SAFE_THRESHOLD:
+                return "Safe Email", prob
+            elif prob < PHISHING_THRESHOLD:
+                return "Phishing Email", (1 - prob)
+            else:
+                # For uncertain cases, be more conservative and mark as phishing
+                return "Phishing Email", (1 - prob)
+            
         except Exception as e:
             logging.error(f"Prediction error: {e}")
             return "Error", 0.0
 
-    def _extract_features(self, email_data):
-        # Implement feature extraction logic here
-        # This is a placeholder - you should implement the actual feature extraction
-        return []
-
     def explain(self, email_data):
-        # Implement explanation logic here
-        # This is a placeholder - you should implement the actual explanation
-        return "AI model analysis explanation"
+        try:
+            if not self.pipeline:
+                return "Model not loaded"
+            
+            # Prepare input data
+            df = self._prepare_features(email_data)
+            
+            # Get probability scores
+            prob = self.pipeline.predict_proba(df)[0][1]
+            
+            # Generate explanation based on adjusted thresholds
+            if prob > 0.6:
+                return "Very likely to be safe"
+            elif prob > 0.4:
+                return "Potentially suspicious"
+            else:
+                return "Likely phishing"
+            
+        except Exception as e:
+            logging.error(f"Explanation error: {e}")
+            return "Error generating explanation"
 
 # =======================
 # Report Generation
@@ -533,13 +587,16 @@ class SecurityScannerGUI:
                 self.tree.delete(i)
             
             for info in self.report.entries:
+                # Format classification with confidence
+                classification = f"{info['classification']} ({info.get('confidence', 'N/A')})"
+                
                 vals = (
                     info['id'],
                     (info['subject'][:47] + '…') if len(info['subject']) > 50 else info['subject'],
                     info['from'],
                     info['date'],
                     info['risk'],
-                    info['classification'],
+                    classification,  # Use the formatted classification
                     info['score_url'],
                     info['score_attachment'],
                     info['score_ai'],
@@ -593,18 +650,18 @@ class SecurityScannerGUI:
                 scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
                 text.config(yscrollcommand=scrollbar.set)
                 
-                # Add content
+                # Add content with confidence information
                 detail_text = (
                     f"From: {rec['from']}\n"
                     f"Subject: {rec['subject']}\n"
                     f"Date: {rec['date']}\n"
                     f"Risk Level: {rec['risk']}\n"
-                    f"Classification: {rec['classification']}\n"
+                    f"Classification: {rec['classification']} ({rec.get('confidence', 'N/A')})\n"
                     f"Total Score: {rec['total_score']}/4\n\n"
                     f"Detailed Scores:\n"
                     f"URL Analysis: {rec['score_url']}/1\n"
                     f"Attachment Scan: {rec['score_attachment']}/1\n"
-                    f"AI Classification: {rec['score_ai']}/1\n"
+                    f"AI Classification: {rec['score_ai']}/3\n"
                     f"Certificate Check: {rec['score_cert']}/1\n\n"
                     f"Reasons:\n{rec['reasons']}\n\n"
                     f"AI Explanation:\n{rec['explanation']}"
@@ -784,40 +841,72 @@ class SecurityScannerGUI:
 # =======================
 # Processing & Monitoring
 # =======================
-def process_and_handle(item,fetcher,analyzer,vt,detector,report):
-    uid,msg=item
+def process_and_handle(item, fetcher, analyzer, vt, detector, report):
+    uid, msg = item
     try:
-        data=analyzer.parse(msg)
-        header_fail,reasons=analyzer.analyze_headers(msg)
-        url_flags=[(u,vt.scan_url(u)) for u in data['urls']] if data['urls'] else []
-        att_flags=[(n,vt.scan_file(b,n)) for n,b in data['attachments']] if data['attachments'] else []
-        cls,ai_score=detector.predict(data); expl=detector.explain(data)
-        if header_fail: reasons.append('Header fail')
-        reasons += [f"URL {u} flagged" for u,f in url_flags if f]
-        reasons += [f"Attachment {n} flagged" for n,f in att_flags if f]
-        score_url=0 if any(f for _,f in url_flags) else 1
-        score_att=0 if any(f for _,f in att_flags) else 1
-        score_ai =0 if cls!='Safe Email' else 1
-        score_cert=0 if header_fail else 1
-        total=score_url+score_att+score_ai+score_cert
-        risk='High' if reasons or total<4 else 'Low'
+        data = analyzer.parse(msg)
+        header_fail, reasons = analyzer.analyze_headers(msg)
+        url_flags = [(u, vt.scan_url(u)) for u in data['urls']] if data['urls'] else []
+        att_flags = [(n, vt.scan_file(b, n)) for n, b in data['attachments']] if data['attachments'] else []
+        
+        # Get classification and confidence
+        cls, confidence = detector.predict(data)
+        expl = detector.explain(data)
+        
+        if header_fail:
+            reasons.append('Header fail')
+        reasons += [f"URL {u} flagged" for u, f in url_flags if f]
+        reasons += [f"Attachment {n} flagged" for n, f in att_flags if f]
+        
+        # Calculate scores (each out of 1)
+        score_url = 0 if any(f for _, f in url_flags) else 1
+        score_att = 0 if any(f for _, f in att_flags) else 1
+        score_cert = 0 if header_fail else 1
+        
+        # Calculate AI score based on confidence (out of 3)
+        if cls == "Safe Email":
+            score_ai = min(3, int(confidence * 3))  # Convert confidence to score out of 3
+        else:
+            score_ai = min(3, int((1 - confidence) * 3))  # Convert confidence to score out of 3
+        
+        total = score_url + score_att + score_cert + score_ai
+        
+        risk = 'High' if reasons or total < 4 else 'Low'
+        
         print(f"\nDetailed Scores for UID {uid}:")
         print(f"{'-'*20}+{'-'*7}+{'-'*30}")
         print(f"{'URL Analysis':<20}|{score_url:^7}|{'No suspicious links detected' if score_url else 'Suspicious link found'}")
         print(f"{'Attachment Scan':<20}|{score_att:^7}|{'All attachments clean' if score_att else 'Malicious attachment detected'}")
-        print(f"{'AI Classification':<20}|{score_ai:^7}|{'Model classified as Safe' if score_ai else 'Model flagged as Phishing'}")
+        print(f"{'AI Classification':<20}|{score_ai:^7}|{'Model confidence: ' + f'{confidence*100:.1f}%'}")
         print(f"{'Header Certification':<20}|{score_cert:^7}|{'SPF/DKIM/DMARC passed' if score_cert else 'Header auth failure'}\n")
-        info={'id':uid,'from':data['from'],'subject':data['subject'],'date':data['date'],
-              'risk':risk,'classification':cls,'reasons':'; '.join(reasons),
-              'score_url':score_url,'score_attachment':score_att,
-              'score_ai':score_ai,'score_cert':score_cert,
-              'total_score':total,'explanation':expl}
-        report.add(info);
-        logging.info("UID %s: total_score=%s",uid,total)
-        if cls=='Phishing Email': send_alert('Phishing Detected',f'Email {uid} flagged.')
-        if total<2: fetcher.move_to_detected([uid])
+        
+        info = {
+            'id': uid,
+            'from': data['from'],
+            'subject': data['subject'],
+            'date': data['date'],
+            'risk': risk,
+            'classification': cls,
+            'reasons': '; '.join(reasons),
+            'score_url': score_url,
+            'score_attachment': score_att,
+            'score_ai': score_ai,
+            'score_cert': score_cert,
+            'total_score': total,
+            'explanation': expl,
+            'confidence': f"{confidence*100:.1f}%"
+        }
+        
+        report.add(info)
+        logging.info("UID %s: total_score=%s", uid, total)
+        
+        if cls == 'Phishing Email':
+            send_alert('Phishing Detected', f'Email {uid} flagged.')
+        if total < 3:  # Adjusted threshold for moving to detected folder
+            fetcher.move_to_detected([uid])
+            
     except Exception as e:
-        logging.error("Processing error UID %s: %s",uid,e)
+        logging.error("Processing error UID %s: %s", uid, e)
 
 def live_email_monitor(fetcher,analyzer,vt,detector,report,stop_event,interval=POLL_INTERVAL):
     seen=set()
