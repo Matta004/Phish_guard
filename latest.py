@@ -96,45 +96,126 @@ class EmailFetcher:
         self.user = user
         self.password = password
         self.conn = None
+        self.max_retries = 3
+        self.retry_delay = 5  # seconds
 
     def connect(self):
-        try:
-            self.conn = imapclient.IMAPClient(self.server, ssl=True)
-            self.conn.login(self.user, self.password)
-            logging.info("Connected to IMAP server.")
-            folders = [f[2] for f in self.conn.list_folders()]
-            if DETECTED_FOLDER not in folders:
-                self.conn.create_folder(DETECTED_FOLDER)
-                logging.info("Created folder '%s'", DETECTED_FOLDER)
-        except Exception as e:
-            logging.error("IMAP connect error: %s", e)
+        """Connect to IMAP server with retry logic"""
+        for attempt in range(self.max_retries):
+            try:
+                if self.conn:
+                    try:
+                        self.conn.logout()
+                    except:
+                        pass
+                    self.conn = None
+
+                self.conn = imapclient.IMAPClient(self.server, ssl=True, timeout=30)
+                self.conn.login(self.user, self.password)
+                logging.info("Connected to IMAP server.")
+                
+                # Create detected folder if it doesn't exist
+                folders = [f[2] for f in self.conn.list_folders()]
+                if DETECTED_FOLDER not in folders:
+                    self.conn.create_folder(DETECTED_FOLDER)
+                    logging.info("Created folder '%s'", DETECTED_FOLDER)
+                return True
+            except Exception as e:
+                logging.error(f"IMAP connect attempt {attempt + 1} failed: {e}")
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logging.error("Failed to connect to IMAP server after %d attempts", self.max_retries)
+                    return False
 
     def fetch_unseen(self):
-        msgs = []
-        try:
-            self.conn.select_folder("INBOX")
-            uids = self.conn.search("UNSEEN")
-            for uid in uids:
-                raw = self.conn.fetch([uid], ['RFC822'])[uid][b'RFC822']
-                msgs.append((uid, email.message_from_bytes(raw)))
-        except Exception as e:
-            logging.error("Fetch unseen error: %s", e)
-        return msgs
+        """Fetch unseen emails with reconnection logic"""
+        for attempt in range(self.max_retries):
+            try:
+                if not self.conn:
+                    if not self.connect():
+                        return None
+                
+                # Select folder without marking as read
+                self.conn.select_folder("INBOX")
+                # Search for unseen emails without marking them
+                uids = self.conn.search("UNSEEN")
+                msgs = []
+                
+                for uid in uids:
+                    try:
+                        # Fetch without marking as seen
+                        raw = self.conn.fetch([uid], ['RFC822', 'FLAGS'])[uid]
+                        msgs.append((uid, email.message_from_bytes(raw[b'RFC822'])))
+                    except Exception as e:
+                        logging.error(f"Error fetching message {uid}: {e}")
+                        continue
+                
+                return msgs
+            except Exception as e:
+                logging.error(f"Fetch unseen attempt {attempt + 1} failed: {e}")
+                self.conn = None  # Force reconnection
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logging.error("Failed to fetch emails after %d attempts", self.max_retries)
+                    return None
 
     def move_to_detected(self, uids):
-        try:
-            self.conn.move(uids, DETECTED_FOLDER)
-            logging.info("Moved %s to '%s'", uids, DETECTED_FOLDER)
-        except Exception as e:
-            logging.error("Move error: %s", e)
+        """Move emails to detected folder with error handling"""
+        if not uids:
+            return
+            
+        for attempt in range(self.max_retries):
+            try:
+                if not self.conn:
+                    if not self.connect():
+                        return
+                
+                self.conn.move(uids, DETECTED_FOLDER)
+                logging.info("Moved %s to '%s'", uids, DETECTED_FOLDER)
+                return
+            except Exception as e:
+                logging.error(f"Move attempt {attempt + 1} failed: {e}")
+                self.conn = None  # Force reconnection
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logging.error("Failed to move emails after %d attempts", self.max_retries)
 
     def disconnect(self):
+        """Safely disconnect from IMAP server"""
         if self.conn:
             try:
                 self.conn.logout()
                 logging.info("Logged out from IMAP server.")
             except Exception as e:
                 logging.error("Logout error: %s", e)
+            finally:
+                self.conn = None
+
+    def mark_as_unread(self, uids):
+        """Mark emails as unread"""
+        if not uids:
+            return
+            
+        for attempt in range(self.max_retries):
+            try:
+                if not self.conn:
+                    if not self.connect():
+                        return
+                
+                self.conn.select_folder("INBOX")
+                self.conn.remove_flags(uids, ['\\Seen'])
+                logging.info("Marked emails %s as unread", uids)
+                return
+            except Exception as e:
+                logging.error(f"Mark unread attempt {attempt + 1} failed: {e}")
+                self.conn = None  # Force reconnection
+                if attempt < self.max_retries - 1:
+                    time.sleep(self.retry_delay)
+                else:
+                    logging.error("Failed to mark emails as unread after %d attempts", self.max_retries)
 
 # =======================
 # Email Analysis
@@ -182,10 +263,110 @@ class EmailAnalyzer:
         return data
 
     def analyze_headers(self, msg):
-        auth = msg.get('Authentication-Results','')
-        if 'fail' in auth.lower():
-            return True, ['Authentication-Results failure']
-        return False, []
+        """Analyze email headers for authentication and security checks"""
+        reasons = []
+        auth_failures = 0
+        
+        # Get Authentication-Results header
+        auth_results = msg.get('Authentication-Results', '')
+        
+        # Check SPF
+        spf_result = self._extract_auth_result(auth_results, 'spf')
+        if spf_result:
+            if 'fail' in spf_result.lower():
+                reasons.append('SPF authentication failed')
+                auth_failures += 1
+            elif 'softfail' in spf_result.lower():
+                reasons.append('SPF soft fail (suspicious)')
+                auth_failures += 0.5
+        else:
+            reasons.append('No SPF authentication results found')
+            auth_failures += 0.5
+
+        # Check DKIM
+        dkim_result = self._extract_auth_result(auth_results, 'dkim')
+        if dkim_result:
+            if 'fail' in dkim_result.lower():
+                reasons.append('DKIM signature verification failed')
+                auth_failures += 1
+            elif 'neutral' in dkim_result.lower():
+                reasons.append('DKIM neutral result (suspicious)')
+                auth_failures += 0.5
+        else:
+            reasons.append('No DKIM signature found')
+            auth_failures += 0.5
+
+        # Check DMARC
+        dmarc_result = self._extract_auth_result(auth_results, 'dmarc')
+        if dmarc_result:
+            if 'fail' in dmarc_result.lower():
+                reasons.append('DMARC authentication failed')
+                auth_failures += 1
+            elif 'softfail' in dmarc_result.lower():
+                reasons.append('DMARC soft fail (suspicious)')
+                auth_failures += 0.5
+        else:
+            reasons.append('No DMARC authentication results found')
+            auth_failures += 0.5
+
+        # Check Received-SPF header
+        received_spf = msg.get('Received-SPF', '')
+        if received_spf:
+            if 'fail' in received_spf.lower():
+                reasons.append('Received-SPF header indicates failure')
+                auth_failures += 0.5
+
+        # Check Return-Path vs From
+        return_path = msg.get('Return-Path', '')
+        from_addr = msg.get('From', '')
+        if return_path and from_addr:
+            # Extract email addresses
+            return_email = self._extract_email(return_path)
+            from_email = self._extract_email(from_addr)
+            if return_email and from_email and return_email.lower() != from_email.lower():
+                reasons.append('Return-Path and From addresses do not match')
+                auth_failures += 0.5
+
+        # Check for suspicious headers
+        suspicious_headers = [
+            'X-Originating-IP',
+            'X-Forwarded-For',
+            'X-Forwarded-By',
+            'X-Originating-Email'
+        ]
+        for header in suspicious_headers:
+            if msg.get(header):
+                reasons.append(f'Suspicious header found: {header}')
+                auth_failures += 0.5
+
+        # Determine overall authentication status
+        if auth_failures >= 2:
+            return True, reasons  # Likely phishing
+        elif auth_failures >= 1:
+            return True, reasons  # Suspicious
+        else:
+            return False, reasons  # Likely legitimate
+
+    def _extract_auth_result(self, auth_results, auth_type):
+        """Extract authentication result for a specific type from Authentication-Results header"""
+        if not auth_results:
+            return None
+            
+        # Look for pattern like: auth_type=result
+        pattern = rf'{auth_type}=([^\s;]+)'
+        match = re.search(pattern, auth_results, re.IGNORECASE)
+        if match:
+            return match.group(1)
+        return None
+
+    def _extract_email(self, header_value):
+        """Extract email address from header value"""
+        # Common email pattern
+        pattern = r'[\w\.-]+@[\w\.-]+\.\w+'
+        match = re.search(pattern, header_value)
+        if match:
+            return match.group(0)
+        return None
 
 # =======================
 # VirusTotal Integration
@@ -195,37 +376,187 @@ class VirusTotalScanner:
         self.api_key = api_key
         self.base_url = "https://www.virustotal.com/api/v3"
         self.headers = {"x-apikey": self.api_key}
+        self.last_request_time = 0
+        self.min_request_interval = 15  # Minimum seconds between requests to respect rate limits
+        self.max_retries = 3  # Maximum number of retries for failed requests
+        self.analysis_wait_time = 30  # Seconds to wait for analysis completion
+
+    def _wait_for_rate_limit(self):
+        """Ensure we respect rate limits by waiting if necessary"""
+        current_time = time.time()
+        time_since_last = current_time - self.last_request_time
+        if time_since_last < self.min_request_interval:
+            time.sleep(self.min_request_interval - time_since_last)
+        self.last_request_time = time.time()
+
+    def _make_request(self, url, method='GET', files=None, retry_count=0):
+        """Make a request to VirusTotal API with proper error handling and retries"""
+        try:
+            self._wait_for_rate_limit()
+            if method == 'GET':
+                response = requests.get(url, headers=self.headers, timeout=30)
+            else:
+                response = requests.post(url, headers=self.headers, files=files, timeout=30)
+            
+            if response.status_code == 200:
+                return response.json()
+            elif response.status_code == 429:  # Rate limit
+                logging.warning("VirusTotal rate limit reached, waiting...")
+                time.sleep(60)  # Wait a minute before retrying
+                if retry_count < self.max_retries:
+                    return self._make_request(url, method, files, retry_count + 1)
+                return None
+            elif response.status_code == 404:  # Not found
+                logging.warning(f"Resource not found: {url}")
+                return None
+            else:
+                logging.error(f"VirusTotal API error: {response.status_code} - {response.text}")
+                if retry_count < self.max_retries:
+                    time.sleep(5)  # Wait before retry
+                    return self._make_request(url, method, files, retry_count + 1)
+                return None
+        except requests.exceptions.RequestException as e:
+            logging.error(f"VirusTotal request error: {e}")
+            if retry_count < self.max_retries:
+                time.sleep(5)  # Wait before retry
+                return self._make_request(url, method, files, retry_count + 1)
+            return None
+
+    def _submit_url_for_analysis(self, url):
+        """Submit a URL for analysis and return the analysis ID"""
+        try:
+            # Submit URL for analysis
+            submit_url = f"{self.base_url}/urls"
+            # Properly format the URL data
+            submit_data = {"url": url}
+            submit_result = self._make_request(
+                submit_url,
+                method='POST',
+                files={'url': (None, url)}  # Correct format for URL submission
+            )
+            
+            if not submit_result:
+                logging.error("Failed to submit URL for analysis")
+                return None
+                
+            # Extract analysis ID
+            analysis_id = submit_result.get("data", {}).get("id")
+            if not analysis_id:
+                logging.error("No analysis ID received")
+                return None
+                
+            return analysis_id
+        except Exception as e:
+            logging.error(f"Error submitting URL for analysis: {e}")
+            return None
+
+    def _get_analysis_results(self, analysis_id):
+        """Get analysis results for a given analysis ID"""
+        try:
+            analysis_url = f"{self.base_url}/analyses/{analysis_id}"
+            result = self._make_request(analysis_url)
+            
+            if not result:
+                return None
+                
+            # Check if analysis is complete
+            status = result.get("data", {}).get("attributes", {}).get("status")
+            if status == "completed":
+                return result
+            elif status == "queued":
+                return None  # Analysis still in progress
+            else:
+                logging.error(f"Analysis failed with status: {status}")
+                return None
+        except Exception as e:
+            logging.error(f"Error getting analysis results: {e}")
+            return None
 
     def scan_url(self, url):
+        """Scan a URL and return detailed results"""
         try:
+            # First try to get existing analysis
             url_id = requests.utils.quote(url, safe='')
-            response = requests.get(f"{self.base_url}/urls/{url_id}", headers=self.headers)
-            if response.status_code == 200:
-                data = response.json()
-                stats = data.get("data", {}).get("attributes", {}).get("last_analysis_stats", {})
-                return stats.get("malicious", 0) > 0
-            return False
+            result = self._make_request(f"{self.base_url}/urls/{url_id}")
+            
+            if not result:
+                # If no existing analysis, submit for new analysis
+                analysis_id = self._submit_url_for_analysis(url)
+                if not analysis_id:
+                    return {'malicious': False, 'error': 'Failed to submit URL for analysis'}
+                
+                # Wait for analysis to complete
+                start_time = time.time()
+                while time.time() - start_time < self.analysis_wait_time:
+                    result = self._get_analysis_results(analysis_id)
+                    if result:
+                        break
+                    time.sleep(5)  # Wait before checking again
+                
+                if not result:
+                    return {'malicious': False, 'error': 'Analysis timed out'}
+                
+                # Get the final URL analysis
+                result = self._make_request(f"{self.base_url}/urls/{url_id}")
+                if not result:
+                    return {'malicious': False, 'error': 'Failed to get final analysis'}
+            
+            data = result.get("data", {})
+            attributes = data.get("attributes", {})
+            stats = attributes.get("last_analysis_stats", {})
+            
+            return {
+                'malicious': stats.get("malicious", 0) > 0,
+                'harmless': stats.get("harmless", 0),
+                'suspicious': stats.get("suspicious", 0),
+                'undetected': stats.get("undetected", 0),
+                'total_engines': sum(stats.values()),
+                'last_analysis_date': attributes.get("last_analysis_date"),
+                'categories': attributes.get("categories", [])
+            }
         except Exception as e:
-            logging.error(f"VirusTotal URL scan error: {e}")
-            return False
+            logging.error(f"URL scan error: {e}")
+            return {'malicious': False, 'error': str(e)}
 
     def scan_file(self, file_bytes, filename):
+        """Scan a file and return detailed results"""
         try:
+            # First upload the file
             files = {"file": (filename, file_bytes)}
-            response = requests.post(f"{self.base_url}/files", headers=self.headers, files=files)
-            if response.status_code == 200:
-                data = response.json()
-                file_id = data.get("data", {}).get("id")
-                if file_id:
-                    analysis_response = requests.get(f"{self.base_url}/analyses/{file_id}", headers=self.headers)
-                    if analysis_response.status_code == 200:
-                        analysis_data = analysis_response.json()
-                        stats = analysis_data.get("data", {}).get("attributes", {}).get("stats", {})
-                        return stats.get("malicious", 0) > 0
-            return False
+            upload_result = self._make_request(f"{self.base_url}/files", method='POST', files=files)
+            
+            if not upload_result:
+                return {'malicious': False, 'error': 'File upload failed'}
+            
+            file_id = upload_result.get("data", {}).get("id")
+            if not file_id:
+                return {'malicious': False, 'error': 'No file ID received'}
+            
+            # Wait for analysis to complete
+            time.sleep(5)  # Wait for initial analysis
+            
+            # Get analysis results
+            analysis_result = self._make_request(f"{self.base_url}/analyses/{file_id}")
+            
+            if not analysis_result:
+                return {'malicious': False, 'error': 'Analysis request failed'}
+            
+            data = analysis_result.get("data", {})
+            attributes = data.get("attributes", {})
+            stats = attributes.get("stats", {})
+            
+            return {
+                'malicious': stats.get("malicious", 0) > 0,
+                'harmless': stats.get("harmless", 0),
+                'suspicious': stats.get("suspicious", 0),
+                'undetected': stats.get("undetected", 0),
+                'total_engines': sum(stats.values()),
+                'analysis_date': attributes.get("date"),
+                'analysis_id': file_id
+            }
         except Exception as e:
-            logging.error(f"VirusTotal file scan error: {e}")
-            return False
+            logging.error(f"File scan error: {e}")
+            return {'malicious': False, 'error': str(e)}
 
 # =======================
 # Phishing Detection
@@ -846,17 +1177,33 @@ def process_and_handle(item, fetcher, analyzer, vt, detector, report):
     try:
         data = analyzer.parse(msg)
         header_fail, reasons = analyzer.analyze_headers(msg)
-        url_flags = [(u, vt.scan_url(u)) for u in data['urls']] if data['urls'] else []
-        att_flags = [(n, vt.scan_file(b, n)) for n, b in data['attachments']] if data['attachments'] else []
+        
+        # Process URLs with new VT format
+        url_flags = []
+        for url in data['urls']:
+            result = vt.scan_url(url)
+            if result.get('error'):
+                logging.warning(f"URL scan error for {url}: {result['error']}")
+            url_flags.append((url, result.get('malicious', False)))
+            if result.get('malicious'):
+                reasons.append(f"URL {url} flagged by {result.get('total_engines', 0)} engines")
+        
+        # Process attachments with new VT format
+        att_flags = []
+        for name, content in data['attachments']:
+            result = vt.scan_file(content, name)
+            if result.get('error'):
+                logging.warning(f"File scan error for {name}: {result['error']}")
+            att_flags.append((name, result.get('malicious', False)))
+            if result.get('malicious'):
+                reasons.append(f"Attachment {name} flagged by {result.get('total_engines', 0)} engines")
         
         # Get classification and confidence
         cls, confidence = detector.predict(data)
         expl = detector.explain(data)
         
         if header_fail:
-            reasons.append('Header fail')
-        reasons += [f"URL {u} flagged" for u, f in url_flags if f]
-        reasons += [f"Attachment {n} flagged" for n, f in att_flags if f]
+            reasons.append('Header authentication failure')
         
         # Calculate scores (each out of 1)
         score_url = 0 if any(f for _, f in url_flags) else 1
@@ -865,21 +1212,21 @@ def process_and_handle(item, fetcher, analyzer, vt, detector, report):
         
         # Calculate AI score based on confidence (out of 3)
         if cls == "Safe Email":
-            score_ai = min(3, int(confidence * 3))  # Convert confidence to score out of 3
+            score_ai = min(3, int(confidence * 3))
         else:
-            score_ai = min(3, int((1 - confidence) * 3))  # Convert confidence to score out of 3
+            score_ai = min(3, int((1 - confidence) * 3))
         
         total = score_url + score_att + score_cert + score_ai
         
-        risk = 'High' if reasons or total < 4 else 'Low'
+        # Determine risk level
+        if total < 2 or (header_fail and total < 3):
+            risk = 'High'
+        elif total < 3 or len(reasons) > 0:
+            risk = 'Medium'
+        else:
+            risk = 'Low'
         
-        print(f"\nDetailed Scores for UID {uid}:")
-        print(f"{'-'*20}+{'-'*7}+{'-'*30}")
-        print(f"{'URL Analysis':<20}|{score_url:^7}|{'No suspicious links detected' if score_url else 'Suspicious link found'}")
-        print(f"{'Attachment Scan':<20}|{score_att:^7}|{'All attachments clean' if score_att else 'Malicious attachment detected'}")
-        print(f"{'AI Classification':<20}|{score_ai:^7}|{'Model confidence: ' + f'{confidence*100:.1f}%'}")
-        print(f"{'Header Certification':<20}|{score_cert:^7}|{'SPF/DKIM/DMARC passed' if score_cert else 'Header auth failure'}\n")
-        
+        # Prepare email info
         info = {
             'id': uid,
             'from': data['from'],
@@ -894,35 +1241,109 @@ def process_and_handle(item, fetcher, analyzer, vt, detector, report):
             'score_cert': score_cert,
             'total_score': total,
             'explanation': expl,
-            'confidence': f"{confidence*100:.1f}%"
+            'confidence': f"{confidence*100:.1f}%",
+            'urls': data['urls'],
+            'attachments': [name for name, _ in data['attachments']]
         }
         
+        # Add to report
         report.add(info)
-        logging.info("UID %s: total_score=%s", uid, total)
+        logging.info("Processed email UID %s: total_score=%s, risk=%s", uid, total, risk)
         
-        if cls == 'Phishing Email':
-            send_alert('Phishing Detected', f'Email {uid} flagged.')
-        if total < 3:  # Adjusted threshold for moving to detected folder
-            fetcher.move_to_detected([uid])
+        # Handle phishing emails
+        if risk == 'High' or (risk == 'Medium' and cls == 'Phishing Email'):
+            try:
+                # Ensure connection is active
+                if not fetcher.conn:
+                    if not fetcher.connect():
+                        logging.error("Failed to connect to IMAP server for moving phishing email")
+                        return
+                
+                # Move to detected folder
+                fetcher.move_to_detected([uid])
+                logging.info("Moved phishing email UID %s to detected folder", uid)
+                
+                # Send alert
+                alert_msg = (
+                    f"Phishing email detected!\n\n"
+                    f"From: {data['from']}\n"
+                    f"Subject: {data['subject']}\n"
+                    f"Risk Level: {risk}\n"
+                    f"Total Score: {total}/4\n"
+                    f"Reasons: {'; '.join(reasons)}\n"
+                    f"URLs: {', '.join(data['urls'])}\n"
+                    f"Attachments: {', '.join(name for name, _ in data['attachments'])}"
+                )
+                send_alert('Phishing Detected', alert_msg)
+            except Exception as e:
+                logging.error("Failed to handle phishing email UID %s: %s", uid, e)
+        else:
+            # Mark as unread if not phishing
+            try:
+                fetcher.mark_as_unread([uid])
+                logging.info("Marked email UID %s as unread", uid)
+            except Exception as e:
+                logging.error("Failed to mark email UID %s as unread: %s", uid, e)
             
     except Exception as e:
         logging.error("Processing error UID %s: %s", uid, e)
 
-def live_email_monitor(fetcher,analyzer,vt,detector,report,stop_event,interval=POLL_INTERVAL):
-    seen=set()
+def live_email_monitor(fetcher, analyzer, vt, detector, report, stop_event, interval=POLL_INTERVAL):
+    seen = set()
     while not stop_event.is_set():
         try:
-            unseen=fetcher.fetch_unseen()
-            new=[(u,m) for u,m in unseen if u not in seen]
+            # Ensure connection is active
+            if not fetcher.conn:
+                if not fetcher.connect():
+                    logging.error("Failed to connect to IMAP server")
+                    time.sleep(interval)
+                    continue
+            
+            # Fetch only unseen emails
+            try:
+                unseen = fetcher.fetch_unseen()
+                if unseen is None:  # Handle fetch failure
+                    logging.error("Failed to fetch unseen emails")
+                    time.sleep(interval)
+                    continue
+            except Exception as e:
+                logging.error("Error fetching unseen emails: %s", e)
+                time.sleep(interval)
+                continue
+            
+            new = [(u, m) for u, m in unseen if u not in seen]
+            
             if new:
-                logging.info("Found %d new emails",len(new))
-                with ThreadPoolExecutor(max_workers=5) as ex:
-                    for item in new: ex.submit(process_and_handle,item,fetcher,analyzer,vt,detector,report)
-                for u,_ in new: seen.add(u)
+                logging.info("Found %d new emails", len(new))
+                
+                # Process emails in parallel but limit concurrent processing
+                with ThreadPoolExecutor(max_workers=3) as ex:
+                    futures = []
+                    for item in new:
+                        futures.append(ex.submit(process_and_handle, item, fetcher, analyzer, vt, detector, report))
+                    
+                    # Wait for all processing to complete
+                    for future in futures:
+                        try:
+                            future.result()
+                        except Exception as e:
+                            logging.error("Error in email processing: %s", e)
+                
+                # Only mark emails as processed if fetch was successful
+                for u, _ in new:
+                    seen.add(u)
+                
+                # Clean up old seen UIDs to prevent memory growth
+                if len(seen) > 1000:
+                    seen = set(list(seen)[-1000:])
+            
         except Exception as e:
-            logging.error("Polling error: %s",e)
-            try: fetcher.connect()
-            except Exception as ex: logging.error("Reconnect failed: %s",ex)
+            logging.error("Polling error: %s", e)
+            try:
+                fetcher.connect()
+            except Exception as ex:
+                logging.error("Reconnect failed: %s", ex)
+        
         time.sleep(interval)
 
 def main():
