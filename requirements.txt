@@ -1,0 +1,14 @@
+# Core requirements for the Email Security Scanner project
+imapclient
+email  # part of stdlib, but included for clarity
+requests
+joblib
+pandas
+scikit-learn
+matplotlib
+numpy
+tkinter  # part of stdlib, but included for clarity
+vt-py
+concurrent-log-handler
+# For logging with rotating file handler
+# For Windows, you may need to install pywin32 for some Tkinter features 
